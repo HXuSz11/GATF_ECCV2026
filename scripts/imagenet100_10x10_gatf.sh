@@ -15,7 +15,7 @@ do
     --distillation gatf --lambda-geometry 5 --lambda-transport-cycle 2 --lambda-isometry 0 \
     --preserve-pairwise-geometry --lambda-pairwise-geometry 0.05 \
     --prior-kind gls --prior-mode train_adapt --prior-ridge 1e-2 --prior-batches 50 --prior-residual-zero-init 1 \
-    --gls-target-cov diag \
+    --gls-target-cov diag --no-adapt-train \
     --prior-update-interval 10 --prior-update-ema --prior-update-ema-m 0.90 \
     --exp-name imagenet100_10x10_GATF_GLSdiag_trainAdapt_updEMA_int10_m0p90_seed${SEED} \
     --results-path ${RESULTS}

@@ -19,7 +19,7 @@ do
     --fp-use-grad-norm --lambda-fp-gn 1 \
     --DA-lr 0.05 --DA-wd 1e-4 \
     --prior-kind gls --prior-mode train_adapt --prior-ridge 1e-2 --prior-batches 50 --prior-residual-zero-init 1 \
-    --gls-target-cov diag \
+    --gls-target-cov diag --no-adapt-train \
     --prior-update-interval 10 --prior-update-ema --prior-update-ema-m 0.90 \
     --exp-name cub200_10x20_GATF_GLSdiag_trainAdapt_fpce1_rhoce0p5_DAlr0p05_seed${SEED} \
     --results-path ${RESULTS}

@@ -260,6 +260,9 @@ class Appr(Inc_Learning_Appr):
         # -------------------- NEW: drift logging --------------------
         log_drift_every=0,              # 0 disables
 
+        # -------------------- Adapter refinement gate --------------------
+        adapt_train=True,              # False with --no-adapt-train: reuse the co-evolved adapter only
+
         # --------------------  Feature Perturbation knobs --------------------
         rho_ce=0.0,                     # FP step size for classification loss (A)
         lambda_fp_ce=0.5,               # weight for adversarial classification loss
@@ -288,6 +291,9 @@ class Appr(Inc_Learning_Appr):
         # ---------------- NEW: drift logging ----------------
         self.log_drift_every = int(log_drift_every)
         self.all_val_loader = None  # will be set by train_loop
+
+        # ---------------- Adapter refinement gate ----------------
+        self.adapt_train = bool(adapt_train)
 
         # ---------------- PRIOR config ----------------
         self.prior_kind = str(prior_kind).lower()
@@ -347,7 +353,8 @@ class Appr(Inc_Learning_Appr):
             f"FP(rho_ce={self.rho_ce:g}, lambda_fp_ce={self.lambda_fp_ce:g}, "
             f"gradNorm={'on' if self.fp_use_grad_norm else 'off'}, lambda_fp_gn={self.lambda_fp_gn:g}) | "
             f"DA(lr={self.DA_lr:g}, wd={self.DA_wd:g}) | "
-            f"logDriftEvery={self.log_drift_every}"
+            f"logDriftEvery={self.log_drift_every} | "
+            f"adaptTrain={self.adapt_train}"
         )
 
         # ---------------- Build backbone ----------------
@@ -539,6 +546,14 @@ class Appr(Inc_Learning_Appr):
         # NEW: drift log
         parser.add_argument('--log-drift-every', type=int, default=0,
                             help='Save drift_task{t}_epoch{e}.csv every E epochs (0 disables).')
+
+        # Adapter refinement gate. The camera-ready best CIFAR/Tiny scripts use --no-adapt-train,
+        # which skips the secondary post-hoc adapter training stage and reuses the co-evolved adapter.
+        parser.add_argument('--adapt-train', dest='adapt_train', action='store_true',
+                            help='Train/refine the adapter inside adapt_distributions (default).')
+        parser.add_argument('--no-adapt-train', dest='adapt_train', action='store_false',
+                            help='Skip post-hoc adapter refinement and reuse the co-evolved adapter for Gaussian transport.')
+        parser.set_defaults(adapt_train=True)
 
         # --------------------  Feature Perturbation knobs --------------------
         parser.add_argument('--rho-ce', type=float, default=0.0, help='FP step size for classification loss (task 0 only).')
@@ -1696,88 +1711,110 @@ class Appr(Inc_Learning_Appr):
                                                  num_workers=val_loader.num_workers, shuffle=False, drop_last=True)
         self.model.eval()
 
-        adapter_residual = self._build_projection(self.adapter_type).to(self.device, non_blocking=True)
-        adapter = adapter_residual
-
-        if t > 0 and self.prior_kind != "none" and self.prior_mode in ("adapt", "train_adapt"):
-            prior_info = self._estimate_prior(trn_loader)
-            self._prior_cache = copy.deepcopy(prior_info)
-            adapter = self._wrap_adapter_with_prior(prior_info, adapter_residual).to(self.device, non_blocking=True)
-            print(f"[PRIOR/ADAPT] kind={self.prior_kind} ridge={self.prior_ridge:g} batches={self.prior_batches} "
-                  f"zero_init_res={self.prior_residual_zero_init} "
-                  f"{'(gls_target_cov='+self.gls_target_cov+')' if self.prior_kind=='gls' else ''}")
-
-        # Warm-start residual from adapter trained during backbone training (if available)
-        if hasattr(self, "adapter_module") and self.adapter_module is not None:
-            try:
-                if hasattr(self.adapter_module, "residual") and hasattr(adapter, "residual"):
-                    adapter.residual.load_state_dict(self.adapter_module.residual.state_dict(), strict=False)
-                elif hasattr(adapter, "residual"):
-                    adapter.residual.load_state_dict(self.adapter_module.state_dict(), strict=False)
-                else:
-                    adapter.load_state_dict(self.adapter_module.state_dict(), strict=False)
-                print("[adapt_distributions] Warm-start adapter (residual) from backbone training.")
-            except Exception as e:
-                print(f"[adapt_distributions] Warm-start failed: {e}")
-
-        optimizer, lr_scheduler = self.get_adapter_optimizer(adapter.parameters())
+        # Save the incoming old statistics before any transport is applied.
         old_means = copy.deepcopy(self.means)
         old_covs = copy.deepcopy(self.covs)
 
-        for epoch in range(self.nepochs // 2):
-            adapter.train()
-            train_loss, valid_loss = [], []
-            train_ac, train_determinant = [], []
+        if not self.adapt_train:
+            # Camera-ready default for the strongest CIFAR/Tiny runs:
+            # skip secondary post-hoc adapter fitting and directly reuse the adapter
+            # co-evolved during backbone training. This matches the one-stage GATF setting.
+            if hasattr(self, "adapter_module") and self.adapter_module is not None:
+                print("[adapt_distributions] Training DISABLED (--no-adapt-train). Reusing co-evolved adapter_module.")
+                adapter = self.adapter_module.to(self.device).eval()
+            else:
+                print("[adapt_distributions] --no-adapt-train but adapter_module is None; building an untrained adapter for transport.")
+                adapter_residual = self._build_projection(self.adapter_type).to(self.device, non_blocking=True)
+                adapter = adapter_residual
+                if t > 0 and self.prior_kind != "none" and self.prior_mode in ("adapt", "train_adapt"):
+                    prior_info = self._estimate_prior(trn_loader)
+                    self._prior_cache = copy.deepcopy(prior_info)
+                    adapter = self._wrap_adapter_with_prior(prior_info, adapter_residual).to(self.device, non_blocking=True)
+                    print(f"[PRIOR/ADAPT][NO-TRAIN] kind={self.prior_kind} ridge={self.prior_ridge:g} batches={self.prior_batches} "
+                          f"zero_init_res={self.prior_residual_zero_init} "
+                          f"{'(gls_target_cov='+self.gls_target_cov+')' if self.prior_kind=='gls' else ''}")
+                self.adapter_module = copy.deepcopy(adapter).eval()
+        else:
+            adapter_residual = self._build_projection(self.adapter_type).to(self.device, non_blocking=True)
+            adapter = adapter_residual
 
-            for images, _ in trn_loader:
-                bsz = images.shape[0]
-                images = images.to(self.device, non_blocking=True)
-                optimizer.zero_grad()
-                with torch.no_grad():
-                    z_new = self.model(images)
-                    z_old = self.old_model(images)
-                z_old_to_new = adapter(z_old)
-                loss = F.mse_loss(z_old_to_new, z_new)
-                ac, det = 0.0, torch.tensor(0.0, device=self.device)
-                if self.alpha > 0:
-                    ac, det = loss_ac(z_old_to_new, self.beta)
-                total = loss + self.alpha * ac
-                total.backward()
-                torch.nn.utils.clip_grad_norm_(adapter.parameters(), 1.0)
-                optimizer.step()
-                train_loss.append(float(bsz * loss))
-                train_ac.append(float(ac))
-                train_determinant.append(float(torch.clamp(torch.abs(det), max=1e8)))
+            if t > 0 and self.prior_kind != "none" and self.prior_mode in ("adapt", "train_adapt"):
+                prior_info = self._estimate_prior(trn_loader)
+                self._prior_cache = copy.deepcopy(prior_info)
+                adapter = self._wrap_adapter_with_prior(prior_info, adapter_residual).to(self.device, non_blocking=True)
+                print(f"[PRIOR/ADAPT] kind={self.prior_kind} ridge={self.prior_ridge:g} batches={self.prior_batches} "
+                      f"zero_init_res={self.prior_residual_zero_init} "
+                      f"{'(gls_target_cov='+self.gls_target_cov+')' if self.prior_kind=='gls' else ''}")
 
-            lr_scheduler.step()
+            # Warm-start residual from adapter trained during backbone training (if available)
+            if hasattr(self, "adapter_module") and self.adapter_module is not None:
+                try:
+                    if hasattr(self.adapter_module, "residual") and hasattr(adapter, "residual"):
+                        adapter.residual.load_state_dict(self.adapter_module.residual.state_dict(), strict=False)
+                    elif hasattr(adapter, "residual"):
+                        adapter.residual.load_state_dict(self.adapter_module.state_dict(), strict=False)
+                    else:
+                        adapter.load_state_dict(self.adapter_module.state_dict(), strict=False)
+                    print("[adapt_distributions] Warm-start adapter (residual) from backbone training.")
+                except Exception as e:
+                    print(f"[adapt_distributions] Warm-start failed: {e}")
 
-            if epoch % 10 == 9:
-                adapter.eval()
-                with torch.no_grad():
-                    for images, _ in val_loader:
-                        bsz = images.shape[0]
-                        images = images.to(self.device, non_blocking=True)
+            optimizer, lr_scheduler = self.get_adapter_optimizer(adapter.parameters())
+
+            for epoch in range(self.nepochs // 2):
+                adapter.train()
+                train_loss, valid_loss = [], []
+                train_ac, train_determinant = [], []
+
+                for images, _ in trn_loader:
+                    bsz = images.shape[0]
+                    images = images.to(self.device, non_blocking=True)
+                    optimizer.zero_grad()
+                    with torch.no_grad():
                         z_new = self.model(images)
                         z_old = self.old_model(images)
-                        z_old_to_new = adapter(z_old)
-                        total = F.mse_loss(z_old_to_new, z_new)
-                        valid_loss.append(float(bsz * total))
+                    z_old_to_new = adapter(z_old)
+                    loss = F.mse_loss(z_old_to_new, z_new)
+                    ac, det = 0.0, torch.tensor(0.0, device=self.device)
+                    if self.alpha > 0:
+                        ac, det = loss_ac(z_old_to_new, self.beta)
+                    total = loss + self.alpha * ac
+                    total.backward()
+                    torch.nn.utils.clip_grad_norm_(adapter.parameters(), 1.0)
+                    optimizer.step()
+                    train_loss.append(float(bsz * loss))
+                    train_ac.append(float(ac))
+                    train_determinant.append(float(torch.clamp(torch.abs(det), max=1e8)))
 
-            train_loss = sum(train_loss) / max(len(trn_loader.dataset), 1)
-            train_determinant = sum(train_determinant) / max(len(train_determinant), 1)
-            train_ac = sum(train_ac) / max(len(train_ac), 1)
-            valid_loss = sum(valid_loss) / max(len(val_loader.dataset), 1)
-            print(f"Epoch: {epoch} Train loss: {train_loss:.2f} Val loss: {valid_loss:.2f} "
-                  f"Singularity: {train_ac:.3f} Det: {train_determinant:.5f}")
+                lr_scheduler.step()
 
-        # ------------------------------ DUMP (adapter_after) ------------------------------
-        if self.dump:
-            exp_dir = self._get_exp_dir()
-            torch.save(adapter.state_dict(), f"{exp_dir}/adapter_after_{t}.pth")
-            if self._prior_cache is not None:
-                torch.save(self._prior_cache, f"{exp_dir}/prior_after_{t}.pth")
+                if epoch % 10 == 9:
+                    adapter.eval()
+                    with torch.no_grad():
+                        for images, _ in val_loader:
+                            bsz = images.shape[0]
+                            images = images.to(self.device, non_blocking=True)
+                            z_new = self.model(images)
+                            z_old = self.old_model(images)
+                            z_old_to_new = adapter(z_old)
+                            total = F.mse_loss(z_old_to_new, z_new)
+                            valid_loss.append(float(bsz * total))
 
-        self.adapter_module = copy.deepcopy(adapter).eval()
+                train_loss = sum(train_loss) / max(len(trn_loader.dataset), 1)
+                train_determinant = sum(train_determinant) / max(len(train_determinant), 1)
+                train_ac = sum(train_ac) / max(len(train_ac), 1)
+                valid_loss = sum(valid_loss) / max(len(val_loader.dataset), 1)
+                print(f"Epoch: {epoch} Train loss: {train_loss:.2f} Val loss: {valid_loss:.2f} "
+                      f"Singularity: {train_ac:.3f} Det: {train_determinant:.5f}")
+
+            # ------------------------------ DUMP (adapter_after) ------------------------------
+            if self.dump:
+                exp_dir = self._get_exp_dir()
+                torch.save(adapter.state_dict(), f"{exp_dir}/adapter_after_{t}.pth")
+                if self._prior_cache is not None:
+                    torch.save(self._prior_cache, f"{exp_dir}/prior_after_{t}.pth")
+
+            self.adapter_module = copy.deepcopy(adapter).eval()
 
         # Distribution-level adaptation (full A = prior + residual)
         with torch.no_grad():

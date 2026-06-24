@@ -166,6 +166,7 @@ Important GATF-specific arguments include:
 --prior-update-interval
 --prior-update-ema
 --prior-update-ema-m
+--no-adapt-train
 ```
 
 The Gaussian/Bayes evaluation is enabled by:
