@@ -5,6 +5,8 @@ This repository contains the official implementation for the ECCV 2026 paper:
 **Geometry-Anchored Transport Framework for Exemplar-Free Class-Incremental Learning**
 Hongye Xu, Bartosz Krawczyk
 
+OpenReview: https://openreview.net/forum?id=2dQolt7sGt
+
 ------
 
 ## Overview
@@ -188,7 +190,8 @@ If you find this repository useful, please cite our paper:
   title     = {Geometry-Anchored Transport Framework for Exemplar-Free Class-Incremental Learning},
   author    = {Xu, Hongye and Krawczyk, Bartosz},
   booktitle = {European Conference on Computer Vision (ECCV)},
-  year      = {2026}
+  year      = {2026},
+  url       = {https://openreview.net/forum?id=2dQolt7sGt}
 }
 ```
 
